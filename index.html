@@ -94,7 +94,10 @@ function App() {
   const [tracks, setTracks] = useState([]);
   const [progress, setProgress] = useState({ current: 0, total: 0, message: "" });
   const [playlists, setPlaylists] = useState([]);
-  const [createdPlaylists, setCreatedPlaylists] = useState([]);
+  const [createdPlaylists, setCreatedPlaylists] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("playlist_forge_created_playlists") || "[]"); }
+    catch (_) { return []; }
+  });
   const [error, setError] = useState(null);
   const [copied, setCopied] = useState(false);
 
@@ -208,9 +211,13 @@ function App() {
 
       const enriched = allTracks.map((item) => {
         const genres = item.track.artists.flatMap((a) => artistGenres[a.id] || []);
+        const releaseDate = item.track.album?.release_date || "";
+        const releaseYear = releaseDate ? Number(releaseDate.slice(0, 4)) : null;
         return {
           id: item.track.id, uri: item.track.uri, name: item.track.name,
           artists: item.track.artists.map((a) => a.name).join(", "),
+          album: item.track.album?.name || "",
+          releaseDate, releaseYear,
           genres: [...new Set(genres)],
         };
       });
@@ -226,20 +233,24 @@ function App() {
       setProgress({ current: 0, total: 100, message: "Claude is reading the room" });
 
       const compact = trackList
-        .map((t, i) => `${i}|${t.name.slice(0, 50)}|${t.artists.slice(0, 50)}|${t.genres.slice(0, 4).join(",") || "none"}`)
+        .map((t, i) => `${i}|${t.name.slice(0, 50)}|${t.artists.slice(0, 50)}|${t.releaseYear || "unknown"}|${t.genres.slice(0, 4).join(",") || "none"}`)
         .join("\n");
 
-      const prompt = `Organize this Spotify library into playlists. Format per line: index|track|artist|genres
+      const prompt = `Organize this Spotify library into playlists. Format per line: index|track|artist|releaseYear|genres
 
 ${compact}
 
 Rules:
-- Group by genre, MERGING ADJACENT/RELATED genres into single playlists (e.g. "indie rock" + "alt rock" + "indie pop" = one playlist; "trap" + "hip hop" + "rap" = one; "outlaw country" + "country" + "americana" = one)
-- EVERY song (indices 0 to ${trackList.length - 1}) must appear in exactly ONE playlist
-- Avoid playlists with fewer than 4 tracks - merge small clusters into adjacent genre groups
-- Songs with "none" genre: place them in the closest adjacent playlist based on artist name knowledge
-- Playlist names should be evocative and short (2-4 words), not literal genre names. Think: "Backroad Country", "Late Night Static", "Saturday Anthems"
-- Descriptions should be punchy, under 90 chars
+- Group by BOTH genre and era. Genre matters first, but era matters almost as much.
+- Do NOT put songs together if they are not close in era, even if the genre is similar. As a rule of thumb, keep playlists within roughly the same decade or a 10-15 year window.
+- Make separate playlists for older vs newer versions of the same broad genre, such as 80s pop, 2000s pop, and modern pop, or classic country vs modern country.
+- Merge adjacent/related genres only when they also fit the same era. For example, 2000s pop punk and 2000s alt rock can merge, but 1970s rock and 2010s indie rock should not.
+- Obvious exception: Disney, musical, soundtrack, kids, and animated movie music can stay together even when eras differ.
+- EVERY song (indices 0 to ${trackList.length - 1}) must appear in exactly ONE playlist.
+- Avoid playlists with fewer than 4 tracks when possible. Merge small clusters into the nearest genre AND era match, unless it is Disney/soundtrack music.
+- Songs with "unknown" year or "none" genre: place them in the closest playlist using artist/song knowledge, genre clues, and era clues.
+- Playlist names should include a vibe plus era when useful. Think: "2000s Pop Rush", "Classic Country Roads", "Modern Worship Glow", "Disney Singalong".
+- Descriptions should be punchy, under 90 chars.
 
 Return ONLY valid JSON, no markdown, no preamble:
 {"playlists":[{"name":"...","description":"...","trackIndices":[0,1,2]}]}`;
@@ -286,61 +297,111 @@ Return ONLY valid JSON, no markdown, no preamble:
     });
   };
 
-  const createPlaylists = async () => {
+  const parseJsonSafe = (text) => {
+    try { return text ? JSON.parse(text) : {}; } catch (_) { return {}; }
+  };
+
+  const updatePlaylistDetails = async (playlistId, playlist) => {
+    const resp = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: playlist.name, description: playlist.description, public: false }),
+    });
+
+    if (!resp.ok) {
+      const data = parseJsonSafe(await resp.text());
+      throw new Error(`Could not update ${playlist.name}: ${data.error?.message || resp.status}`);
+    }
+  };
+
+  const replacePlaylistTracks = async (playlistId, playlistName, trackUris) => {
+    const firstBatch = trackUris.slice(0, 100);
+    const replaceResp = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ uris: firstBatch }),
+    });
+
+    const replaceText = await replaceResp.text();
+    const replaceData = parseJsonSafe(replaceText);
+    if (!replaceResp.ok) {
+      throw new Error(`Could not refresh songs in ${playlistName}: ${replaceData.error?.message || replaceResp.status}`);
+    }
+
+    for (let j = 100; j < trackUris.length; j += 100) {
+      const batch = trackUris.slice(j, j + 100);
+      const addResp = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ uris: batch }),
+      });
+
+      const addText = await addResp.text();
+      const addData = parseJsonSafe(addText);
+      if (!addResp.ok) {
+        throw new Error(`Could not add songs to ${playlistName}: ${addData.error?.message || addResp.status}`);
+      }
+    }
+  };
+
+  const syncPlaylists = async (refreshExisting = false) => {
     setStep("creating");
     setError(null);
     const created = [];
+    const saved = createdPlaylists.length ? createdPlaylists : [];
+
     try {
       for (let i = 0; i < playlists.length; i++) {
         const playlist = playlists[i];
-        setProgress({ current: i, total: playlists.length, message: `Building "${playlist.name}"` });
+        const trackUris = playlist.trackIndices.map((idx) => tracks[idx]?.uri).filter(Boolean);
+        const existing = refreshExisting ? saved[i] : null;
 
-        const createResp = await fetch(`https://api.spotify.com/v1/me/playlists`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ name: playlist.name, description: playlist.description, public: false }),
+        setProgress({
+          current: i,
+          total: playlists.length,
+          message: existing?.id ? `Refreshing "${playlist.name}"` : `Building "${playlist.name}"`,
         });
 
-        const createText = await createResp.text();
-        let newPlaylist = {};
-        try { newPlaylist = createText ? JSON.parse(createText) : {}; } catch (_) {}
+        let targetPlaylist = existing;
 
-        if (!createResp.ok) {
-          throw new Error(newPlaylist.error?.message || `Could not create ${playlist.name}: ${createResp.status}`);
-        }
-
-        const trackUris = playlist.trackIndices.map((idx) => tracks[idx]?.uri).filter(Boolean);
-        if (trackUris.length === 0) {
-          created.push({ ...newPlaylist, trackCount: 0 });
-          continue;
-        }
-
-        for (let j = 0; j < trackUris.length; j += 100) {
-          const batch = trackUris.slice(j, j + 100);
-          const addResp = await fetch(`https://api.spotify.com/v1/playlists/${newPlaylist.id}/tracks`, {
+        if (existing?.id) {
+          await updatePlaylistDetails(existing.id, playlist);
+          await replacePlaylistTracks(existing.id, playlist.name, trackUris);
+          targetPlaylist = { ...existing, name: playlist.name, description: playlist.description };
+        } else {
+          const createResp = await fetch(`https://api.spotify.com/v1/me/playlists`, {
             method: "POST",
             headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ uris: batch }),
+            body: JSON.stringify({ name: playlist.name, description: playlist.description, public: false }),
           });
 
-          const addText = await addResp.text();
-          let addData = {};
-          try { addData = addText ? JSON.parse(addText) : {}; } catch (_) {}
+          const createText = await createResp.text();
+          const newPlaylist = parseJsonSafe(createText);
 
-          if (!addResp.ok) {
-            throw new Error(`Could not add songs to ${playlist.name}: ${addData.error?.message || addResp.status}`);
+          if (!createResp.ok) {
+            throw new Error(newPlaylist.error?.message || `Could not create ${playlist.name}: ${createResp.status}`);
           }
+
+          await replacePlaylistTracks(newPlaylist.id, playlist.name, trackUris);
+          targetPlaylist = newPlaylist;
         }
-        created.push({ ...newPlaylist, trackCount: trackUris.length });
+
+        created.push({ ...targetPlaylist, trackCount: trackUris.length });
       }
+
       setCreatedPlaylists(created);
+      localStorage.setItem("playlist_forge_created_playlists", JSON.stringify(created));
       setProgress({ current: playlists.length, total: playlists.length, message: "Complete" });
       setStep("done");
     } catch (e) {
       setError(`Creation failed: ${e.message}`);
       setCreatedPlaylists(created);
+      if (created.length) localStorage.setItem("playlist_forge_created_playlists", JSON.stringify(created));
     }
   };
+
+  const createPlaylists = () => syncPlaylists(false);
+  const refreshExistingPlaylists = () => syncPlaylists(true);
 
   const reset = () => {
     setStep("setup"); setAccessToken(null); setUser(null); setTracks([]);
@@ -508,14 +569,22 @@ Return ONLY valid JSON, no markdown, no preamble:
                   {tracks.length.toLocaleString()} songs · sorted by Claude · move songs before committing
                 </p>
               </div>
-              <button onClick={createPlaylists} className="bg-green-500 hover:bg-green-400 text-black font-bold px-8 py-3.5 rounded-full transition-all flex items-center gap-2 pulse-green">
-                <Icon name="sparkles" className="w-5 h-5" />
-                CREATE ALL IN SPOTIFY
-              </button>
+              <div className="flex flex-wrap gap-3">
+                {createdPlaylists.length > 0 && (
+                  <button onClick={refreshExistingPlaylists} className="border border-green-500/60 hover:border-green-400 text-green-400 hover:text-green-300 font-bold px-6 py-3.5 rounded-full transition-all flex items-center gap-2">
+                    <Icon name="library" className="w-5 h-5" />
+                    REFRESH EXISTING
+                  </button>
+                )}
+                <button onClick={createPlaylists} className="bg-green-500 hover:bg-green-400 text-black font-bold px-8 py-3.5 rounded-full transition-all flex items-center gap-2 pulse-green">
+                  <Icon name="sparkles" className="w-5 h-5" />
+                  CREATE NEW IN SPOTIFY
+                </button>
+              </div>
             </div>
 
             <div className="mb-6 p-4 border border-green-500/20 bg-green-500/5 rounded-xl text-sm text-neutral-300">
-              Review the playlists below. Open a playlist, then use the dropdown beside any song to move it into a different playlist before creating everything in Spotify.
+              Review the playlists below. Open a playlist, use the dropdown beside any song to move it, then either create new Spotify playlists or refresh the playlists already made from this page.
             </div>
 
             <div className="grid md:grid-cols-2 gap-4">
@@ -548,7 +617,7 @@ Return ONLY valid JSON, no markdown, no preamble:
                                 <span className="text-neutral-600 mono text-[10px] flex-shrink-0">{String(tIdx + 1).padStart(3, "0")}</span>
                                 <span className="truncate">
                                   <span className="text-white">{t.name}</span>
-                                  <span className="text-neutral-500"> — {t.artists}</span>
+                                  <span className="text-neutral-500"> — {t.artists}{t.releaseYear ? ` (${t.releaseYear})` : ""}</span>
                                 </span>
                               </div>
                               <select
@@ -625,7 +694,10 @@ Return ONLY valid JSON, no markdown, no preamble:
               ))}
             </div>
 
-            <div className="text-center">
+            <div className="text-center flex flex-wrap gap-3 justify-center">
+              <button onClick={() => setStep("review")} className="mono text-xs text-green-400 hover:text-green-300 tracking-widest border border-green-500/50 hover:border-green-400 rounded-full px-6 py-3 transition-colors">
+                EDIT / REFRESH THESE PLAYLISTS
+              </button>
               <button onClick={reset} className="mono text-xs text-neutral-500 hover:text-white tracking-widest border border-neutral-800 hover:border-neutral-600 rounded-full px-6 py-3 transition-colors">
                 START OVER
               </button>
