@@ -281,7 +281,7 @@ Return ONLY valid JSON, no markdown, no preamble:
         const playlist = playlists[i];
         setProgress({ current: i, total: playlists.length, message: `Building "${playlist.name}"` });
 
-        const createResp = await fetch(`https://api.spotify.com/v1/users/${user.id}/playlists`, {
+        const createResp = await fetch(`https://api.spotify.com/v1/me/playlists`, {
           method: "POST",
           headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
           body: JSON.stringify({ name: playlist.name, description: playlist.description, public: false }),
